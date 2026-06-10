@@ -1,5 +1,8 @@
 torch
 gurobipy
+cvxpy
+cvxpylayers
+diffcp
 numpy
 pandas
 PyYAML

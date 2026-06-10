@@ -13,6 +13,7 @@ import torch
 from loguru import logger
 from torch.optim.lr_scheduler import MultiStepLR as Scheduler
 
+from src.CVXPYLayerSolver import solve_ordered_targets_torch
 from src.CVPSolver import SPSolution, SolverConfig, solve
 from src.RewardWorkerPool import RewardWorkerPool
 from src.TSPEnv import RolloutResult, TSPEnv, rollout_batch
@@ -333,10 +334,26 @@ class OnlineTSPTrainer:
         self.scheduler = Scheduler(self.optimizer, **scheduler_params) if scheduler_params else None
 
         self.solver_config = SolverConfig(
+            solver_backend=str(self.trainer_params.get("solver_backend", "gurobi")),
             gurobi_time_limit=self.trainer_params.get("gurobi_time_limit"),
             gurobi_threads=int(self.trainer_params.get("gurobi_threads", 16)),
             output_flag=int(self.trainer_params.get("output_flag", 0)),
+            cvxpylayer_solver_args=dict(self.trainer_params.get("cvxpylayer_solver_args", {}) or {}),
+            cvxpylayer_dtype=str(self.trainer_params.get("cvxpylayer_dtype", "float64")),
         )
+        self.cvxpylayer_aux_enable = bool(self.trainer_params.get("cvxpylayer_aux_enable", False))
+        self.cvxpylayer_aux_weight = float(self.trainer_params.get("cvxpylayer_aux_weight", 0.0))
+        self.cvxpylayer_aux_candidates = max(1, int(self.trainer_params.get("cvxpylayer_aux_candidates", 1)))
+        self.cvxpylayer_aux_max_instances_per_batch = int(
+            self.trainer_params.get("cvxpylayer_aux_max_instances_per_batch", 0)
+        )
+        self.cvxpylayer_aux_selection = str(self.trainer_params.get("cvxpylayer_aux_selection", "best")).lower()
+        self.cvxpylayer_aux_device = str(self.trainer_params.get("cvxpylayer_aux_device", "cpu")).lower()
+        self.cvxpylayer_aux_normalize_by_size = bool(
+            self.trainer_params.get("cvxpylayer_aux_normalize_by_size", False)
+        )
+        self.sinkhorn_temperature = float(self.trainer_params.get("sinkhorn_temperature", 0.5))
+        self.sinkhorn_iters = int(self.trainer_params.get("sinkhorn_iters", 20))
         self.penalty_reward = float(self.trainer_params.get("penalty_reward", -1e6))
         self.grad_clip = float(self.trainer_params.get("grad_clip", 1.0))
         self.train_batch_size = int(self.trainer_params.get("train_batch_size", 64))
@@ -507,9 +524,12 @@ class OnlineTSPTrainer:
         solver_calls = len(pending)
         if pending:
             parallel_solver_config = SolverConfig(
+                solver_backend=self.solver_config.solver_backend,
                 gurobi_time_limit=self.solver_config.gurobi_time_limit,
                 gurobi_threads=self.parallel_solver_threads,
                 output_flag=self.solver_config.output_flag,
+                cvxpylayer_solver_args=dict(self.solver_config.cvxpylayer_solver_args),
+                cvxpylayer_dtype=self.solver_config.cvxpylayer_dtype,
             )
             tasks = [
                 (entry["instance"], entry["sequence"], parallel_solver_config)
@@ -542,9 +562,12 @@ class OnlineTSPTrainer:
         solver_calls = len(pending)
         if pending:
             parallel_solver_config = SolverConfig(
+                solver_backend=self.solver_config.solver_backend,
                 gurobi_time_limit=self.solver_config.gurobi_time_limit,
                 gurobi_threads=self.parallel_solver_threads,
                 output_flag=self.solver_config.output_flag,
+                cvxpylayer_solver_args=dict(self.solver_config.cvxpylayer_solver_args),
+                cvxpylayer_dtype=self.solver_config.cvxpylayer_dtype,
             )
             tasks = [
                 (entry["instance"], entry["sequence"], parallel_solver_config)
@@ -572,7 +595,139 @@ class OnlineTSPTrainer:
             return self._compute_batch_rewards_parallel(instances, rollout_result)
         return self._compute_batch_rewards_serial(instances, rollout_result)
 
-    def _train_one_batch(self, batch_size: int) -> tuple[float, float, float, float, int]:
+    def _sinkhorn(self, log_scores: torch.Tensor) -> torch.Tensor:
+        out = log_scores
+        for _ in range(max(self.sinkhorn_iters, 1)):
+            out = out - torch.logsumexp(out, dim=-1, keepdim=True)
+            out = out - torch.logsumexp(out, dim=-2, keepdim=True)
+        return out.exp()
+
+    @staticmethod
+    def _hard_permutation_from_sequence(
+        sequences: torch.Tensor,
+        problem_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        hard_perm = torch.zeros(
+            (sequences.size(0), problem_size, problem_size),
+            dtype=dtype,
+            device=device,
+        )
+        return hard_perm.scatter(2, sequences.to(device=device)[:, :, None], 1.0)
+
+    def _build_aux_indices(self, rewards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, pomo_size = rewards.shape
+        max_instances = self.cvxpylayer_aux_max_instances_per_batch
+        if max_instances <= 0:
+            max_instances = batch_size
+        max_instances = min(batch_size, max_instances)
+
+        batch_indices = torch.arange(max_instances, device=rewards.device)
+        if self.cvxpylayer_aux_selection == "first":
+            pomo_indices = torch.zeros(
+                (max_instances, self.cvxpylayer_aux_candidates),
+                dtype=torch.long,
+                device=rewards.device,
+            )
+        else:
+            candidate_count = min(self.cvxpylayer_aux_candidates, pomo_size)
+            pomo_indices = rewards[:max_instances].topk(candidate_count, dim=1).indices
+
+        expanded_batch_indices = batch_indices[:, None].expand_as(pomo_indices).reshape(-1)
+        expanded_pomo_indices = pomo_indices.reshape(-1)
+        return expanded_batch_indices, expanded_pomo_indices
+
+    def _compute_cvxpylayer_aux_loss(
+        self,
+        instances,
+        sequences: torch.Tensor,
+        decoder_prob_steps: list[torch.Tensor],
+        rewards: torch.Tensor,
+    ) -> tuple[torch.Tensor, int]:
+        zero = torch.zeros((), dtype=torch.float32, device=self.device)
+        if (
+            not self.cvxpylayer_aux_enable
+            or self.cvxpylayer_aux_weight <= 0
+            or not decoder_prob_steps
+            or sequences.size(-1) <= 1
+        ):
+            return zero, 0
+
+        problem_size = int(sequences.size(-1))
+        batch_indices, pomo_indices = self._build_aux_indices(rewards.detach())
+        aux_count = int(batch_indices.numel())
+        if aux_count == 0:
+            return zero, 0
+
+        aux_device = torch.device("cpu") if self.cvxpylayer_aux_device == "cpu" else self.device
+        aux_dtype = torch.float64 if self.solver_config.cvxpylayer_dtype == "float64" else torch.float32
+
+        selected_sequences = sequences[batch_indices, pomo_indices].to(device=aux_device)
+        hard_perm = self._hard_permutation_from_sequence(
+            selected_sequences,
+            problem_size=problem_size,
+            dtype=aux_dtype,
+            device=aux_device,
+        )
+
+        decoder_probs = torch.stack(decoder_prob_steps, dim=2)
+        selected_decoder_probs = decoder_probs[batch_indices, pomo_indices].to(device=aux_device, dtype=aux_dtype)
+        start_row = hard_perm[:, :1, :]
+        soft_base = torch.cat([start_row, selected_decoder_probs], dim=1)
+        sinkhorn_scores = torch.log(soft_base.clamp_min(1e-12)) / max(self.sinkhorn_temperature, 1e-6)
+        soft_perm = self._sinkhorn(sinkhorn_scores)
+
+        straight_through_perm = hard_perm.detach() - soft_perm.detach() + soft_perm
+
+        batch_ids_cpu = batch_indices.detach().cpu().tolist()
+        selected_instances = [instances[int(index)] for index in batch_ids_cpu]
+        targets = torch.stack(
+            [
+                torch.as_tensor(instance.targets, dtype=aux_dtype, device=aux_device)
+                for instance in selected_instances
+            ],
+            dim=0,
+        )
+        depots = torch.stack(
+            [
+                torch.as_tensor(instance.depot, dtype=aux_dtype, device=aux_device)
+                for instance in selected_instances
+            ],
+            dim=0,
+        )
+        carrier_speeds = torch.as_tensor(
+            [float(instance.carrier_speed) for instance in selected_instances],
+            dtype=aux_dtype,
+            device=aux_device,
+        )
+        uav_speeds = torch.as_tensor(
+            [float(instance.uav_speed) for instance in selected_instances],
+            dtype=aux_dtype,
+            device=aux_device,
+        )
+        endurances = torch.as_tensor(
+            [float(instance.endurance) for instance in selected_instances],
+            dtype=aux_dtype,
+            device=aux_device,
+        )
+
+        ordered_targets = torch.bmm(straight_through_perm, targets)
+        result = solve_ordered_targets_torch(
+            depot=depots,
+            ordered_targets=ordered_targets,
+            carrier_speed=carrier_speeds,
+            uav_speed=uav_speeds,
+            endurance=endurances,
+            solver_args=self.solver_config.cvxpylayer_solver_args,
+            dtype=aux_dtype,
+        )
+        aux_objectives = result["objective"]
+        if self.cvxpylayer_aux_normalize_by_size:
+            aux_objectives = aux_objectives / max(problem_size, 1)
+        return aux_objectives.mean().to(self.device, dtype=torch.float32), aux_count
+
+    def _train_one_batch(self, batch_size: int) -> tuple[float, float, float, float, int, float, int]:
         self.model.train()
         problem_size = self._sample_problem_size()
         self.env.load_problems(batch_size, self.device, problem_size=problem_size)
@@ -584,9 +739,18 @@ class OnlineTSPTrainer:
         batch_size_eff = len(instances)
         pomo_size = self.env.pomo_size
         log_prob_sum = torch.zeros((batch_size_eff, pomo_size), device=self.device)
+        decoder_prob_steps: list[torch.Tensor] = []
 
         while not done:
-            selected, prob = self.model(state, decode_type="sample", use_pomo_start=True)
+            selected_count_before = state.selected_count
+            selected, prob, all_probs = self.model(
+                state,
+                decode_type="sample",
+                use_pomo_start=True,
+                return_all_probs=True,
+            )
+            if selected_count_before >= 2:
+                decoder_prob_steps.append(all_probs[:, :, 1:])
             state, _, done = self.env.step(selected)
             log_prob_sum = log_prob_sum + prob.clamp_min(1e-12).log()
 
@@ -600,7 +764,14 @@ class OnlineTSPTrainer:
         rewards, feasible_ratio, solver_calls = self._compute_batch_rewards(instances, rollout_result)
 
         advantage = rewards - rewards.mean(dim=1, keepdim=True)
-        loss = -(advantage * rollout_result.log_probs).mean()
+        policy_loss = -(advantage * rollout_result.log_probs).mean()
+        aux_loss, aux_count = self._compute_cvxpylayer_aux_loss(
+            instances=instances,
+            sequences=sequences,
+            decoder_prob_steps=decoder_prob_steps,
+            rewards=rewards,
+        )
+        loss = policy_loss + self.cvxpylayer_aux_weight * aux_loss
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -609,7 +780,15 @@ class OnlineTSPTrainer:
 
         best_reward = rewards.max(dim=1).values
         score_mean = float((-best_reward).mean().item())
-        return score_mean, float(loss.item()), feasible_ratio, float(problem_size), solver_calls
+        return (
+            score_mean,
+            float(loss.item()),
+            feasible_ratio,
+            float(problem_size),
+            solver_calls,
+            float(aux_loss.detach().item()),
+            aux_count,
+        )
 
     def _append_metrics_row(self, row: dict[str, Any]) -> None:
         write_header = not self.metrics_path.exists()
@@ -640,6 +819,8 @@ class OnlineTSPTrainer:
     def _train_one_epoch(self, epoch: int) -> dict[str, float]:
         total_score = 0.0
         total_loss = 0.0
+        total_aux_loss = 0.0
+        total_aux_count = 0
         total_feasible = 0.0
         total_solver_calls = 0
         total_batches = 0
@@ -651,10 +832,14 @@ class OnlineTSPTrainer:
         while episode < self.train_episodes:
             remaining = self.train_episodes - episode
             batch_size = min(self.train_batch_size, remaining)
-            score, loss, feasible_ratio, problem_size, solver_calls = self._train_one_batch(batch_size)
+            score, loss, feasible_ratio, problem_size, solver_calls, aux_loss, aux_count = self._train_one_batch(
+                batch_size
+            )
 
             total_score += score * batch_size
             total_loss += loss * batch_size
+            total_aux_loss += aux_loss * batch_size
+            total_aux_count += aux_count
             total_feasible += feasible_ratio * batch_size
             total_problem_size += problem_size * batch_size
             total_solver_calls += solver_calls
@@ -670,7 +855,7 @@ class OnlineTSPTrainer:
             if should_log_initial or should_log_progress:
                 progress_bar = _format_progress_bar(episode, self.train_episodes, width=self.progress_bar_width)
                 logger.info(
-                    "Epoch {:3d}: {} {:6d}/{:6d}({:5.1f}%)  J: {:3.0f}  Score: {:.4f}  Loss: {:.4f}",
+                    "Epoch {:3d}: {} {:6d}/{:6d}({:5.1f}%)  J: {:3.0f}  Score: {:.4f}  Loss: {:.4f}  Aux: {:.4f}",
                     epoch,
                     progress_bar,
                     episode,
@@ -679,12 +864,15 @@ class OnlineTSPTrainer:
                     problem_size,
                     total_score / max(episode, 1),
                     total_loss / max(episode, 1),
+                    total_aux_loss / max(episode, 1),
                 )
 
         return {
             "epoch": float(epoch),
             "train_score": total_score / max(self.train_episodes, 1),
             "train_loss": total_loss / max(self.train_episodes, 1),
+            "cvxpylayer_aux_loss": total_aux_loss / max(self.train_episodes, 1),
+            "cvxpylayer_aux_count": float(total_aux_count),
             "train_feasible_ratio": total_feasible / max(self.train_episodes, 1),
             "avg_problem_size": total_problem_size / max(self.train_episodes, 1),
             "solver_calls": float(total_solver_calls),
@@ -712,11 +900,12 @@ class OnlineTSPTrainer:
                     self._save_checkpoint(epoch, metrics, self.output_dir / "last.pt")
 
                 logger.info(
-                    "Epoch {:4d}/{:4d}: Score={:.4f} Loss={:.4f} Feas={:.3f} AvgJ={:.2f}",
+                    "Epoch {:4d}/{:4d}: Score={:.4f} Loss={:.4f} Aux={:.4f} Feas={:.3f} AvgJ={:.2f}",
                     epoch,
                     self.epochs,
                     metrics["train_score"],
                     metrics["train_loss"],
+                    metrics["cvxpylayer_aux_loss"],
                     metrics["train_feasible_ratio"],
                     metrics["avg_problem_size"],
                 )

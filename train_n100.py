@@ -8,6 +8,7 @@ REWARD_PARALLEL = True
 REWARD_BACKEND = "persistent_pool"
 REWARD_PARALLEL_WORKERS = 64
 PARALLEL_SOLVER_THREADS = 1
+SOLVER_BACKEND = "cvxpylayer"
 
 
 ##########################################################################################
@@ -60,7 +61,22 @@ trainer_params = {
     "train_episodes": 100 * 1000,
     "train_batch_size": 512,
     "checkpoint_interval": 25,
+    "solver_backend": SOLVER_BACKEND,
     "gurobi_threads": 64,
+    "cvxpylayer_solver_args": {
+        "eps": 1e-5,
+        "max_iters": 10000,
+    },
+    "cvxpylayer_dtype": "float64",
+    "cvxpylayer_aux_enable": True,
+    "cvxpylayer_aux_weight": 1e-3,
+    "cvxpylayer_aux_candidates": 1,
+    "cvxpylayer_aux_max_instances_per_batch": 2,
+    "cvxpylayer_aux_selection": "best",
+    "cvxpylayer_aux_device": "cpu",
+    "cvxpylayer_aux_normalize_by_size": False,
+    "sinkhorn_temperature": 0.5,
+    "sinkhorn_iters": 20,
     "penalty_reward": -1e6,
     "grad_clip": 1.0,
     "seed": 1234,

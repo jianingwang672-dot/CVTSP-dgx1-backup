@@ -7,14 +7,18 @@ from typing import Any
 import numpy as np
 
 from CVTSP_SOCP import gurobi_cvp_socp
+from src.CVXPYLayerSolver import solve_fixed_sequence_numpy
 from src.TSProblemDef import CVTSPInstance
 
 
 @dataclass
 class SolverConfig:
+    solver_backend: str = "gurobi"
     gurobi_time_limit: float | None = None
     gurobi_threads: int | None = 16
     output_flag: int = 0
+    cvxpylayer_solver_args: dict[str, Any] = field(default_factory=dict)
+    cvxpylayer_dtype: str = "float64"
 
 
 @dataclass
@@ -80,19 +84,34 @@ def solve(instance: CVTSPInstance, sequence: list[int], config: SolverConfig, en
     _assert_valid_sequence(sequence, instance.J)
     start_time = time.perf_counter()
     try:
-        result = gurobi_cvp_socp(
-            depot=instance.depot,
-            targets=instance.targets,
-            tour=sequence,
-            Vc=instance.carrier_speed,
-            Vv=instance.uav_speed,
-            endurance_a=instance.endurance,
-            threads=config.gurobi_threads,
-            time_limit=config.gurobi_time_limit,
-            test=True,
-            output_flag=config.output_flag,
-            env=env,
-        )
+        backend = str(config.solver_backend).strip().lower()
+        if backend == "gurobi":
+            result = gurobi_cvp_socp(
+                depot=instance.depot,
+                targets=instance.targets,
+                tour=sequence,
+                Vc=instance.carrier_speed,
+                Vv=instance.uav_speed,
+                endurance_a=instance.endurance,
+                threads=config.gurobi_threads,
+                time_limit=config.gurobi_time_limit,
+                test=True,
+                output_flag=config.output_flag,
+                env=env,
+            )
+        elif backend in {"cvxpylayer", "cvxpy_layer", "cvxpy"}:
+            result = solve_fixed_sequence_numpy(
+                depot=instance.depot,
+                targets=instance.targets,
+                sequence=sequence,
+                carrier_speed=instance.carrier_speed,
+                uav_speed=instance.uav_speed,
+                endurance=instance.endurance,
+                solver_args=config.cvxpylayer_solver_args,
+                dtype=config.cvxpylayer_dtype,
+            )
+        else:
+            raise ValueError(f"unsupported solver_backend '{config.solver_backend}'")
         solve_time = time.perf_counter() - start_time
         return SPSolution(
             objective=float(result["obj"]),

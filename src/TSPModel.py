@@ -37,7 +37,13 @@ class TSPModel(nn.Module):
         self.encoded_nodes = self.encoder(node_features)
         self.decoder.set_kv(self.encoded_nodes)
 
-    def forward(self, state: "Step_State", decode_type: str = "sample", use_pomo_start: bool = True):
+    def forward(
+        self,
+        state: "Step_State",
+        decode_type: str = "sample",
+        use_pomo_start: bool = True,
+        return_all_probs: bool = False,
+    ):
         if self.encoded_nodes is None:
             raise RuntimeError("call pre_forward before decoding")
 
@@ -48,6 +54,9 @@ class TSPModel(nn.Module):
         if state.selected_count == 0:
             selected = torch.zeros((batch_size, pomo_size), dtype=torch.long, device=device)
             prob = torch.ones((batch_size, pomo_size), device=device)
+            if return_all_probs:
+                all_probs = F.one_hot(selected, num_classes=self.encoded_nodes.size(1)).to(dtype=prob.dtype)
+                return selected, prob, all_probs
             return selected, prob
 
         if state.selected_count == 1 and use_pomo_start:
@@ -57,6 +66,9 @@ class TSPModel(nn.Module):
             prob = torch.ones((batch_size, pomo_size), device=device)
             encoded_first = _get_encoding(self.encoded_nodes, selected)
             self.decoder.set_q1(encoded_first)
+            if return_all_probs:
+                all_probs = F.one_hot(selected, num_classes=self.encoded_nodes.size(1)).to(dtype=prob.dtype)
+                return selected, prob, all_probs
             return selected, prob
 
         encoded_last_node = _get_encoding(self.encoded_nodes, state.current_node)
@@ -82,6 +94,8 @@ class TSPModel(nn.Module):
         if state.selected_count == 1 and not use_pomo_start:
             encoded_first = _get_encoding(self.encoded_nodes, selected)
             self.decoder.set_q1(encoded_first)
+        if return_all_probs:
+            return selected, prob, probs
         return selected, prob
 
 

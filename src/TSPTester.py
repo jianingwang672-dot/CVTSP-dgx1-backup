@@ -298,9 +298,12 @@ class OnlineTSPTester:
         self.model.eval()
 
         self.solver_config = SolverConfig(
+            solver_backend=str(self.tester_params.get("solver_backend", "gurobi")),
             gurobi_time_limit=self.tester_params.get("gurobi_time_limit"),
             gurobi_threads=int(self.tester_params.get("gurobi_threads", 16)),
             output_flag=int(self.tester_params.get("output_flag", 0)),
+            cvxpylayer_solver_args=dict(self.tester_params.get("cvxpylayer_solver_args", {}) or {}),
+            cvxpylayer_dtype=str(self.tester_params.get("cvxpylayer_dtype", "float64")),
         )
         self.test_episodes = int(self.tester_params.get("test_episodes", 1000))
         self.test_batch_size = int(self.tester_params.get("test_batch_size", 64))

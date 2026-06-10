@@ -4,6 +4,7 @@
 DEBUG_MODE = False
 USE_CUDA = not DEBUG_MODE
 CUDA_DEVICE_NUM = 0
+SOLVER_BACKEND = "cvxpylayer"
 
 
 ##########################################################################################
@@ -53,7 +54,13 @@ tester_params = {
     "decode_type": "sample",
     "augmentation_enable": False,
     "aug_factor": 8,
+    "solver_backend": SOLVER_BACKEND,
     "gurobi_threads": 32,
+    "cvxpylayer_solver_args": {
+        "eps": 1e-5,
+        "max_iters": 10000,
+    },
+    "cvxpylayer_dtype": "float64",
     "seed": 1234,
     "result_folder": os.path.join("outputs", "test__cvtsp_real529_n100"),
     "log_level": "INFO",

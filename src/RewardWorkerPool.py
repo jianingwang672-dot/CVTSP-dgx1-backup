@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from queue import Empty
 from typing import Any
 
-import gurobipy as gp
-
 from src.CVPSolver import SPSolution, SolverConfig, solve
 
 
@@ -40,12 +38,15 @@ def _worker_main(
 ) -> None:
     env = None
     try:
-        env = gp.Env(params={"OutputFlag": int(env_output_flag)})
         while True:
             task = request_queue.get()
             if task is None:
                 break
             try:
+                if str(task.solver_config.solver_backend).strip().lower() == "gurobi" and env is None:
+                    import gurobipy as gp
+
+                    env = gp.Env(params={"OutputFlag": int(env_output_flag)})
                 solution = solve(task.instance, task.sequence, task.solver_config, env=env)
                 result_queue.put(
                     RewardResult(
