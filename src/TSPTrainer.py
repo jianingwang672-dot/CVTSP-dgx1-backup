@@ -341,16 +341,43 @@ class OnlineTSPTrainer:
             cvxpylayer_solver_args=dict(self.trainer_params.get("cvxpylayer_solver_args", {}) or {}),
             cvxpylayer_dtype=str(self.trainer_params.get("cvxpylayer_dtype", "float64")),
         )
+        self.cvxpylayer_objective_loss_enable = bool(
+            self.trainer_params.get("cvxpylayer_objective_loss_enable", False)
+        )
         self.cvxpylayer_aux_enable = bool(self.trainer_params.get("cvxpylayer_aux_enable", False))
         self.cvxpylayer_aux_weight = float(self.trainer_params.get("cvxpylayer_aux_weight", 0.0))
-        self.cvxpylayer_aux_candidates = max(1, int(self.trainer_params.get("cvxpylayer_aux_candidates", 1)))
-        self.cvxpylayer_aux_max_instances_per_batch = int(
-            self.trainer_params.get("cvxpylayer_aux_max_instances_per_batch", 0)
+        self.cvxpylayer_route_candidates = max(
+            1,
+            int(
+                self.trainer_params.get(
+                    "cvxpylayer_route_candidates",
+                    self.trainer_params.get("cvxpylayer_aux_candidates", 1),
+                )
+            ),
         )
-        self.cvxpylayer_aux_selection = str(self.trainer_params.get("cvxpylayer_aux_selection", "best")).lower()
-        self.cvxpylayer_aux_device = str(self.trainer_params.get("cvxpylayer_aux_device", "cpu")).lower()
-        self.cvxpylayer_aux_normalize_by_size = bool(
-            self.trainer_params.get("cvxpylayer_aux_normalize_by_size", False)
+        self.cvxpylayer_route_max_instances_per_batch = int(
+            self.trainer_params.get(
+                "cvxpylayer_route_max_instances_per_batch",
+                self.trainer_params.get("cvxpylayer_aux_max_instances_per_batch", 0),
+            )
+        )
+        self.cvxpylayer_route_selection = str(
+            self.trainer_params.get(
+                "cvxpylayer_route_selection",
+                self.trainer_params.get("cvxpylayer_aux_selection", "best"),
+            )
+        ).lower()
+        self.cvxpylayer_route_device = str(
+            self.trainer_params.get(
+                "cvxpylayer_route_device",
+                self.trainer_params.get("cvxpylayer_aux_device", "cpu"),
+            )
+        ).lower()
+        self.cvxpylayer_route_normalize_by_size = bool(
+            self.trainer_params.get(
+                "cvxpylayer_route_normalize_by_size",
+                self.trainer_params.get("cvxpylayer_aux_normalize_by_size", False),
+            )
         )
         self.sinkhorn_temperature = float(self.trainer_params.get("sinkhorn_temperature", 0.5))
         self.sinkhorn_iters = int(self.trainer_params.get("sinkhorn_iters", 20))
@@ -359,6 +386,7 @@ class OnlineTSPTrainer:
         self.train_batch_size = int(self.trainer_params.get("train_batch_size", 64))
         self.train_episodes = int(self.trainer_params.get("train_episodes", 100000))
         self.epochs = int(self.trainer_params.get("epochs", 1000))
+        self.resume_extra_epochs = bool(self.trainer_params.get("resume_extra_epochs", False))
         self.checkpoint_interval = int(self.trainer_params.get("checkpoint_interval", 100))
         self.log_first_batch_count = int(self.trainer_params.get("log_first_batch_count", 10))
         self.progress_log_percent = float(self.trainer_params.get("progress_log_percent", 1.0))
@@ -388,6 +416,14 @@ class OnlineTSPTrainer:
             self.best_score = float(checkpoint.get("best_metric", float("inf")))
 
             logger.info("Resumed training from epoch {}", self.start_epoch)
+            if self.resume_extra_epochs:
+                requested_extra_epochs = self.epochs
+                self.epochs = self.start_epoch + requested_extra_epochs - 1
+                logger.info(
+                    "Training {} additional epoch(s), ending at epoch {}",
+                    requested_extra_epochs,
+                    self.epochs,
+                )
         # ===== 新增逻辑结束 =====
         self.cache = RewardCache()
         self.metrics_path = self.output_dir / "metrics.csv"
@@ -616,29 +652,34 @@ class OnlineTSPTrainer:
         )
         return hard_perm.scatter(2, sequences.to(device=device)[:, :, None], 1.0)
 
-    def _build_aux_indices(self, rewards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _build_cvxpylayer_route_indices(self, rewards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, pomo_size = rewards.shape
-        max_instances = self.cvxpylayer_aux_max_instances_per_batch
+        max_instances = self.cvxpylayer_route_max_instances_per_batch
         if max_instances <= 0:
             max_instances = batch_size
         max_instances = min(batch_size, max_instances)
 
         batch_indices = torch.arange(max_instances, device=rewards.device)
-        if self.cvxpylayer_aux_selection == "first":
+        if self.cvxpylayer_route_selection == "first":
             pomo_indices = torch.zeros(
-                (max_instances, self.cvxpylayer_aux_candidates),
+                (max_instances, self.cvxpylayer_route_candidates),
                 dtype=torch.long,
                 device=rewards.device,
             )
         else:
-            candidate_count = min(self.cvxpylayer_aux_candidates, pomo_size)
+            candidate_count = min(self.cvxpylayer_route_candidates, pomo_size)
             pomo_indices = rewards[:max_instances].topk(candidate_count, dim=1).indices
 
         expanded_batch_indices = batch_indices[:, None].expand_as(pomo_indices).reshape(-1)
         expanded_pomo_indices = pomo_indices.reshape(-1)
         return expanded_batch_indices, expanded_pomo_indices
 
-    def _compute_cvxpylayer_aux_loss(
+    def _cvxpylayer_route_loss_requested(self) -> bool:
+        return self.cvxpylayer_objective_loss_enable or (
+            self.cvxpylayer_aux_enable and self.cvxpylayer_aux_weight > 0
+        )
+
+    def _compute_cvxpylayer_route_loss(
         self,
         instances,
         sequences: torch.Tensor,
@@ -647,32 +688,31 @@ class OnlineTSPTrainer:
     ) -> tuple[torch.Tensor, int]:
         zero = torch.zeros((), dtype=torch.float32, device=self.device)
         if (
-            not self.cvxpylayer_aux_enable
-            or self.cvxpylayer_aux_weight <= 0
+            not self._cvxpylayer_route_loss_requested()
             or not decoder_prob_steps
             or sequences.size(-1) <= 1
         ):
             return zero, 0
 
         problem_size = int(sequences.size(-1))
-        batch_indices, pomo_indices = self._build_aux_indices(rewards.detach())
-        aux_count = int(batch_indices.numel())
-        if aux_count == 0:
+        batch_indices, pomo_indices = self._build_cvxpylayer_route_indices(rewards.detach())
+        route_count = int(batch_indices.numel())
+        if route_count == 0:
             return zero, 0
 
-        aux_device = torch.device("cpu") if self.cvxpylayer_aux_device == "cpu" else self.device
-        aux_dtype = torch.float64 if self.solver_config.cvxpylayer_dtype == "float64" else torch.float32
+        route_device = torch.device("cpu") if self.cvxpylayer_route_device == "cpu" else self.device
+        route_dtype = torch.float64 if self.solver_config.cvxpylayer_dtype == "float64" else torch.float32
 
-        selected_sequences = sequences[batch_indices, pomo_indices].to(device=aux_device)
+        selected_sequences = sequences[batch_indices, pomo_indices].to(device=route_device)
         hard_perm = self._hard_permutation_from_sequence(
             selected_sequences,
             problem_size=problem_size,
-            dtype=aux_dtype,
-            device=aux_device,
+            dtype=route_dtype,
+            device=route_device,
         )
 
         decoder_probs = torch.stack(decoder_prob_steps, dim=2)
-        selected_decoder_probs = decoder_probs[batch_indices, pomo_indices].to(device=aux_device, dtype=aux_dtype)
+        selected_decoder_probs = decoder_probs[batch_indices, pomo_indices].to(device=route_device, dtype=route_dtype)
         start_row = hard_perm[:, :1, :]
         soft_base = torch.cat([start_row, selected_decoder_probs], dim=1)
         sinkhorn_scores = torch.log(soft_base.clamp_min(1e-12)) / max(self.sinkhorn_temperature, 1e-6)
@@ -684,32 +724,32 @@ class OnlineTSPTrainer:
         selected_instances = [instances[int(index)] for index in batch_ids_cpu]
         targets = torch.stack(
             [
-                torch.as_tensor(instance.targets, dtype=aux_dtype, device=aux_device)
+                torch.as_tensor(instance.targets, dtype=route_dtype, device=route_device)
                 for instance in selected_instances
             ],
             dim=0,
         )
         depots = torch.stack(
             [
-                torch.as_tensor(instance.depot, dtype=aux_dtype, device=aux_device)
+                torch.as_tensor(instance.depot, dtype=route_dtype, device=route_device)
                 for instance in selected_instances
             ],
             dim=0,
         )
         carrier_speeds = torch.as_tensor(
             [float(instance.carrier_speed) for instance in selected_instances],
-            dtype=aux_dtype,
-            device=aux_device,
+            dtype=route_dtype,
+            device=route_device,
         )
         uav_speeds = torch.as_tensor(
             [float(instance.uav_speed) for instance in selected_instances],
-            dtype=aux_dtype,
-            device=aux_device,
+            dtype=route_dtype,
+            device=route_device,
         )
         endurances = torch.as_tensor(
             [float(instance.endurance) for instance in selected_instances],
-            dtype=aux_dtype,
-            device=aux_device,
+            dtype=route_dtype,
+            device=route_device,
         )
 
         ordered_targets = torch.bmm(straight_through_perm, targets)
@@ -720,12 +760,12 @@ class OnlineTSPTrainer:
             uav_speed=uav_speeds,
             endurance=endurances,
             solver_args=self.solver_config.cvxpylayer_solver_args,
-            dtype=aux_dtype,
+            dtype=route_dtype,
         )
-        aux_objectives = result["objective"]
-        if self.cvxpylayer_aux_normalize_by_size:
-            aux_objectives = aux_objectives / max(problem_size, 1)
-        return aux_objectives.mean().to(self.device, dtype=torch.float32), aux_count
+        route_objectives = result["objective"]
+        if self.cvxpylayer_route_normalize_by_size:
+            route_objectives = route_objectives / max(problem_size, 1)
+        return route_objectives.mean().to(self.device, dtype=torch.float32), route_count
 
     def _train_one_batch(self, batch_size: int) -> tuple[float, float, float, float, int, float, int]:
         self.model.train()
@@ -765,13 +805,20 @@ class OnlineTSPTrainer:
 
         advantage = rewards - rewards.mean(dim=1, keepdim=True)
         policy_loss = -(advantage * rollout_result.log_probs).mean()
-        aux_loss, aux_count = self._compute_cvxpylayer_aux_loss(
+        cvxpylayer_route_loss, cvxpylayer_route_count = self._compute_cvxpylayer_route_loss(
             instances=instances,
             sequences=sequences,
             decoder_prob_steps=decoder_prob_steps,
             rewards=rewards,
         )
-        loss = policy_loss + self.cvxpylayer_aux_weight * aux_loss
+        if self.cvxpylayer_objective_loss_enable:
+            if cvxpylayer_route_count == 0:
+                raise RuntimeError(
+                    "cvxpylayer_objective_loss_enable=True but no differentiable cvxpylayer loss was computed"
+                )
+            loss = cvxpylayer_route_loss
+        else:
+            loss = policy_loss + self.cvxpylayer_aux_weight * cvxpylayer_route_loss
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -786,8 +833,8 @@ class OnlineTSPTrainer:
             feasible_ratio,
             float(problem_size),
             solver_calls,
-            float(aux_loss.detach().item()),
-            aux_count,
+            float(cvxpylayer_route_loss.detach().item()),
+            cvxpylayer_route_count,
         )
 
     def _append_metrics_row(self, row: dict[str, Any]) -> None:
@@ -819,8 +866,8 @@ class OnlineTSPTrainer:
     def _train_one_epoch(self, epoch: int) -> dict[str, float]:
         total_score = 0.0
         total_loss = 0.0
-        total_aux_loss = 0.0
-        total_aux_count = 0
+        total_cvxpylayer_route_loss = 0.0
+        total_cvxpylayer_route_count = 0
         total_feasible = 0.0
         total_solver_calls = 0
         total_batches = 0
@@ -832,14 +879,14 @@ class OnlineTSPTrainer:
         while episode < self.train_episodes:
             remaining = self.train_episodes - episode
             batch_size = min(self.train_batch_size, remaining)
-            score, loss, feasible_ratio, problem_size, solver_calls, aux_loss, aux_count = self._train_one_batch(
-                batch_size
+            score, loss, feasible_ratio, problem_size, solver_calls, cvxpylayer_route_loss, cvxpylayer_route_count = (
+                self._train_one_batch(batch_size)
             )
 
             total_score += score * batch_size
             total_loss += loss * batch_size
-            total_aux_loss += aux_loss * batch_size
-            total_aux_count += aux_count
+            total_cvxpylayer_route_loss += cvxpylayer_route_loss * batch_size
+            total_cvxpylayer_route_count += cvxpylayer_route_count
             total_feasible += feasible_ratio * batch_size
             total_problem_size += problem_size * batch_size
             total_solver_calls += solver_calls
@@ -855,7 +902,7 @@ class OnlineTSPTrainer:
             if should_log_initial or should_log_progress:
                 progress_bar = _format_progress_bar(episode, self.train_episodes, width=self.progress_bar_width)
                 logger.info(
-                    "Epoch {:3d}: {} {:6d}/{:6d}({:5.1f}%)  J: {:3.0f}  Score: {:.4f}  Loss: {:.4f}  Aux: {:.4f}",
+                    "Epoch {:3d}: {} {:6d}/{:6d}({:5.1f}%)  J: {:3.0f}  Score: {:.4f}  Loss: {:.4f}  CVX: {:.4f}",
                     epoch,
                     progress_bar,
                     episode,
@@ -864,15 +911,23 @@ class OnlineTSPTrainer:
                     problem_size,
                     total_score / max(episode, 1),
                     total_loss / max(episode, 1),
-                    total_aux_loss / max(episode, 1),
+                    total_cvxpylayer_route_loss / max(episode, 1),
                 )
 
+        avg_cvxpylayer_route_loss = total_cvxpylayer_route_loss / max(self.train_episodes, 1)
         return {
             "epoch": float(epoch),
             "train_score": total_score / max(self.train_episodes, 1),
             "train_loss": total_loss / max(self.train_episodes, 1),
-            "cvxpylayer_aux_loss": total_aux_loss / max(self.train_episodes, 1),
-            "cvxpylayer_aux_count": float(total_aux_count),
+            "loss_mode": "cvxpylayer_objective" if self.cvxpylayer_objective_loss_enable else "pomo_policy",
+            "cvxpylayer_route_loss": avg_cvxpylayer_route_loss,
+            "cvxpylayer_route_count": float(total_cvxpylayer_route_count),
+            "cvxpylayer_aux_loss": 0.0 if self.cvxpylayer_objective_loss_enable else avg_cvxpylayer_route_loss,
+            "cvxpylayer_aux_count": 0.0 if self.cvxpylayer_objective_loss_enable else float(total_cvxpylayer_route_count),
+            "cvxpylayer_objective_loss": avg_cvxpylayer_route_loss if self.cvxpylayer_objective_loss_enable else 0.0,
+            "cvxpylayer_objective_count": float(total_cvxpylayer_route_count)
+            if self.cvxpylayer_objective_loss_enable
+            else 0.0,
             "train_feasible_ratio": total_feasible / max(self.train_episodes, 1),
             "avg_problem_size": total_problem_size / max(self.train_episodes, 1),
             "solver_calls": float(total_solver_calls),
@@ -900,12 +955,13 @@ class OnlineTSPTrainer:
                     self._save_checkpoint(epoch, metrics, self.output_dir / "last.pt")
 
                 logger.info(
-                    "Epoch {:4d}/{:4d}: Score={:.4f} Loss={:.4f} Aux={:.4f} Feas={:.3f} AvgJ={:.2f}",
+                    "Epoch {:4d}/{:4d}: Mode={} Score={:.4f} Loss={:.4f} CVX={:.4f} Feas={:.3f} AvgJ={:.2f}",
                     epoch,
                     self.epochs,
+                    metrics["loss_mode"],
                     metrics["train_score"],
                     metrics["train_loss"],
-                    metrics["cvxpylayer_aux_loss"],
+                    metrics["cvxpylayer_route_loss"],
                     metrics["train_feasible_ratio"],
                     metrics["avg_problem_size"],
                 )
