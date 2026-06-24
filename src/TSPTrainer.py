@@ -344,6 +344,9 @@ class OnlineTSPTrainer:
         self.cvxpylayer_objective_loss_enable = bool(
             self.trainer_params.get("cvxpylayer_objective_loss_enable", False)
         )
+        self.cvxpylayer_hard_objective_loss_enable = bool(
+            self.trainer_params.get("cvxpylayer_hard_objective_loss_enable", False)
+        )
         self.cvxpylayer_aux_enable = bool(self.trainer_params.get("cvxpylayer_aux_enable", False))
         self.cvxpylayer_aux_weight = float(self.trainer_params.get("cvxpylayer_aux_weight", 0.0))
         self.cvxpylayer_route_candidates = max(
@@ -378,6 +381,15 @@ class OnlineTSPTrainer:
                 "cvxpylayer_route_normalize_by_size",
                 self.trainer_params.get("cvxpylayer_aux_normalize_by_size", False),
             )
+        )
+        self.cvxpylayer_soft_route_method = str(
+            self.trainer_params.get("cvxpylayer_soft_route_method", "unmasked_sinkhorn")
+        ).lower()
+        self.cvxpylayer_fixed_start_logit = float(
+            self.trainer_params.get("cvxpylayer_fixed_start_logit", 20.0)
+        )
+        self.cvxpylayer_hard_route_bias = float(
+            self.trainer_params.get("cvxpylayer_hard_route_bias", 5.0)
         )
         self.sinkhorn_temperature = float(self.trainer_params.get("sinkhorn_temperature", 0.5))
         self.sinkhorn_iters = int(self.trainer_params.get("sinkhorn_iters", 20))
@@ -675,24 +687,40 @@ class OnlineTSPTrainer:
         return expanded_batch_indices, expanded_pomo_indices
 
     def _cvxpylayer_route_loss_requested(self) -> bool:
-        return self.cvxpylayer_objective_loss_enable or (
+        return self.cvxpylayer_hard_objective_loss_enable or self.cvxpylayer_objective_loss_enable or (
             self.cvxpylayer_aux_enable and self.cvxpylayer_aux_weight > 0
         )
+
+    def _cvxpylayer_objective_is_main_loss(self) -> bool:
+        return self.cvxpylayer_hard_objective_loss_enable or self.cvxpylayer_objective_loss_enable
+
+    def _loss_mode_name(self) -> str:
+        if self.cvxpylayer_hard_objective_loss_enable:
+            return "cvxpylayer_hard_objective"
+        if self.cvxpylayer_objective_loss_enable:
+            return "cvxpylayer_objective"
+        return "pomo_policy"
 
     def _compute_cvxpylayer_route_loss(
         self,
         instances,
         sequences: torch.Tensor,
         decoder_prob_steps: list[torch.Tensor],
+        decoder_logit_steps: list[torch.Tensor],
         rewards: torch.Tensor,
     ) -> tuple[torch.Tensor, int]:
         zero = torch.zeros((), dtype=torch.float32, device=self.device)
         if (
             not self._cvxpylayer_route_loss_requested()
-            or not decoder_prob_steps
             or sequences.size(-1) <= 1
         ):
             return zero, 0
+        if not self.cvxpylayer_hard_objective_loss_enable:
+            if self.cvxpylayer_soft_route_method == "unmasked_sinkhorn":
+                if not decoder_logit_steps:
+                    return zero, 0
+            elif not decoder_prob_steps:
+                return zero, 0
 
         problem_size = int(sequences.size(-1))
         batch_indices, pomo_indices = self._build_cvxpylayer_route_indices(rewards.detach())
@@ -711,14 +739,36 @@ class OnlineTSPTrainer:
             device=route_device,
         )
 
-        decoder_probs = torch.stack(decoder_prob_steps, dim=2)
-        selected_decoder_probs = decoder_probs[batch_indices, pomo_indices].to(device=route_device, dtype=route_dtype)
-        start_row = hard_perm[:, :1, :]
-        soft_base = torch.cat([start_row, selected_decoder_probs], dim=1)
-        sinkhorn_scores = torch.log(soft_base.clamp_min(1e-12)) / max(self.sinkhorn_temperature, 1e-6)
-        soft_perm = self._sinkhorn(sinkhorn_scores)
-
-        straight_through_perm = hard_perm.detach() - soft_perm.detach() + soft_perm
+        if self.cvxpylayer_hard_objective_loss_enable:
+            route_perm = hard_perm
+        elif self.cvxpylayer_soft_route_method == "unmasked_sinkhorn":
+            decoder_logits = torch.stack(decoder_logit_steps, dim=2)
+            selected_decoder_logits = decoder_logits[batch_indices, pomo_indices].to(
+                device=route_device,
+                dtype=route_dtype,
+            )
+            start_scores = torch.full_like(
+                hard_perm[:, :1, :],
+                -self.cvxpylayer_fixed_start_logit,
+            )
+            start_scores = start_scores.scatter(
+                2,
+                selected_sequences[:, :1, None],
+                self.cvxpylayer_fixed_start_logit,
+            )
+            sinkhorn_scores = torch.cat([start_scores, selected_decoder_logits], dim=1)
+            sinkhorn_scores = sinkhorn_scores + self.cvxpylayer_hard_route_bias * hard_perm.detach()
+            sinkhorn_scores = sinkhorn_scores / max(self.sinkhorn_temperature, 1e-6)
+            soft_perm = self._sinkhorn(sinkhorn_scores)
+            route_perm = hard_perm.detach() - soft_perm.detach() + soft_perm
+        else:
+            decoder_probs = torch.stack(decoder_prob_steps, dim=2)
+            selected_decoder_probs = decoder_probs[batch_indices, pomo_indices].to(device=route_device, dtype=route_dtype)
+            start_row = hard_perm[:, :1, :]
+            soft_base = torch.cat([start_row, selected_decoder_probs], dim=1)
+            sinkhorn_scores = torch.log(soft_base.clamp_min(1e-12)) / max(self.sinkhorn_temperature, 1e-6)
+            soft_perm = self._sinkhorn(sinkhorn_scores)
+            route_perm = hard_perm.detach() - soft_perm.detach() + soft_perm
 
         batch_ids_cpu = batch_indices.detach().cpu().tolist()
         selected_instances = [instances[int(index)] for index in batch_ids_cpu]
@@ -752,7 +802,7 @@ class OnlineTSPTrainer:
             device=route_device,
         )
 
-        ordered_targets = torch.bmm(straight_through_perm, targets)
+        ordered_targets = torch.bmm(route_perm, targets)
         result = solve_ordered_targets_torch(
             depot=depots,
             ordered_targets=ordered_targets,
@@ -780,17 +830,20 @@ class OnlineTSPTrainer:
         pomo_size = self.env.pomo_size
         log_prob_sum = torch.zeros((batch_size_eff, pomo_size), device=self.device)
         decoder_prob_steps: list[torch.Tensor] = []
+        decoder_logit_steps: list[torch.Tensor] = []
 
         while not done:
             selected_count_before = state.selected_count
-            selected, prob, all_probs = self.model(
+            selected, prob, all_probs, all_logits = self.model(
                 state,
                 decode_type="sample",
                 use_pomo_start=True,
                 return_all_probs=True,
+                return_all_logits=True,
             )
             if selected_count_before >= 2:
                 decoder_prob_steps.append(all_probs[:, :, 1:])
+                decoder_logit_steps.append(all_logits[:, :, 1:])
             state, _, done = self.env.step(selected)
             log_prob_sum = log_prob_sum + prob.clamp_min(1e-12).log()
 
@@ -809,12 +862,13 @@ class OnlineTSPTrainer:
             instances=instances,
             sequences=sequences,
             decoder_prob_steps=decoder_prob_steps,
+            decoder_logit_steps=decoder_logit_steps,
             rewards=rewards,
         )
-        if self.cvxpylayer_objective_loss_enable:
+        if self.cvxpylayer_hard_objective_loss_enable or self.cvxpylayer_objective_loss_enable:
             if cvxpylayer_route_count == 0:
                 raise RuntimeError(
-                    "cvxpylayer_objective_loss_enable=True but no differentiable cvxpylayer loss was computed"
+                    "cvxpylayer objective loss was enabled but no cvxpylayer loss was computed"
                 )
             loss = cvxpylayer_route_loss
         else:
@@ -919,14 +973,18 @@ class OnlineTSPTrainer:
             "epoch": float(epoch),
             "train_score": total_score / max(self.train_episodes, 1),
             "train_loss": total_loss / max(self.train_episodes, 1),
-            "loss_mode": "cvxpylayer_objective" if self.cvxpylayer_objective_loss_enable else "pomo_policy",
+            "loss_mode": self._loss_mode_name(),
             "cvxpylayer_route_loss": avg_cvxpylayer_route_loss,
             "cvxpylayer_route_count": float(total_cvxpylayer_route_count),
-            "cvxpylayer_aux_loss": 0.0 if self.cvxpylayer_objective_loss_enable else avg_cvxpylayer_route_loss,
-            "cvxpylayer_aux_count": 0.0 if self.cvxpylayer_objective_loss_enable else float(total_cvxpylayer_route_count),
-            "cvxpylayer_objective_loss": avg_cvxpylayer_route_loss if self.cvxpylayer_objective_loss_enable else 0.0,
+            "cvxpylayer_aux_loss": 0.0 if self._cvxpylayer_objective_is_main_loss() else avg_cvxpylayer_route_loss,
+            "cvxpylayer_aux_count": 0.0
+            if self._cvxpylayer_objective_is_main_loss()
+            else float(total_cvxpylayer_route_count),
+            "cvxpylayer_objective_loss": avg_cvxpylayer_route_loss
+            if self._cvxpylayer_objective_is_main_loss()
+            else 0.0,
             "cvxpylayer_objective_count": float(total_cvxpylayer_route_count)
-            if self.cvxpylayer_objective_loss_enable
+            if self._cvxpylayer_objective_is_main_loss()
             else 0.0,
             "train_feasible_ratio": total_feasible / max(self.train_episodes, 1),
             "avg_problem_size": total_problem_size / max(self.train_episodes, 1),

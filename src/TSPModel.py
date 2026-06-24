@@ -43,6 +43,7 @@ class TSPModel(nn.Module):
         decode_type: str = "sample",
         use_pomo_start: bool = True,
         return_all_probs: bool = False,
+        return_all_logits: bool = False,
     ):
         if self.encoded_nodes is None:
             raise RuntimeError("call pre_forward before decoding")
@@ -56,6 +57,8 @@ class TSPModel(nn.Module):
             prob = torch.ones((batch_size, pomo_size), device=device)
             if return_all_probs:
                 all_probs = F.one_hot(selected, num_classes=self.encoded_nodes.size(1)).to(dtype=prob.dtype)
+                if return_all_logits:
+                    return selected, prob, all_probs, torch.zeros_like(all_probs)
                 return selected, prob, all_probs
             return selected, prob
 
@@ -68,11 +71,20 @@ class TSPModel(nn.Module):
             self.decoder.set_q1(encoded_first)
             if return_all_probs:
                 all_probs = F.one_hot(selected, num_classes=self.encoded_nodes.size(1)).to(dtype=prob.dtype)
+                if return_all_logits:
+                    return selected, prob, all_probs, torch.zeros_like(all_probs)
                 return selected, prob, all_probs
             return selected, prob
 
         encoded_last_node = _get_encoding(self.encoded_nodes, state.current_node)
-        probs = self.decoder(encoded_last_node, ninf_mask=state.ninf_mask)
+        if return_all_logits:
+            probs, unmasked_logits = self.decoder(
+                encoded_last_node,
+                ninf_mask=state.ninf_mask,
+                return_unmasked_logits=True,
+            )
+        else:
+            probs = self.decoder(encoded_last_node, ninf_mask=state.ninf_mask)
 
         if decode_type == "sample":
             while True:
@@ -95,6 +107,8 @@ class TSPModel(nn.Module):
             encoded_first = _get_encoding(self.encoded_nodes, selected)
             self.decoder.set_q1(encoded_first)
         if return_all_probs:
+            if return_all_logits:
+                return selected, prob, probs, unmasked_logits
             return selected, prob, probs
         return selected, prob
 
@@ -167,7 +181,12 @@ class TSPDecoder(nn.Module):
     def set_q1(self, encoded_q1: torch.Tensor) -> None:
         self.q_first = reshape_by_heads(self.wq_first(encoded_q1), self.config.head_num)
 
-    def forward(self, encoded_last_node: torch.Tensor, ninf_mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        encoded_last_node: torch.Tensor,
+        ninf_mask: torch.Tensor,
+        return_unmasked_logits: bool = False,
+    ):
         if self.k is None or self.v is None or self.single_head_key is None:
             raise RuntimeError("decoder keys/values not initialized")
 
@@ -182,7 +201,10 @@ class TSPDecoder(nn.Module):
         score_scaled = score / sqrt_embedding_dim
         score_clipped = self.config.logit_clipping * torch.tanh(score_scaled)
         score_masked = score_clipped + ninf_mask
-        return F.softmax(score_masked, dim=2)
+        probs = F.softmax(score_masked, dim=2)
+        if return_unmasked_logits:
+            return probs, score_clipped
+        return probs
 
 
 def reshape_by_heads(qkv: torch.Tensor, head_num: int) -> torch.Tensor:
