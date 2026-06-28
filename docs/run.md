@@ -29,6 +29,31 @@ Sinkhorn cvxpylayer auxiliary training:
 - Keep `cvxpylayer_aux_max_instances_per_batch` small because each auxiliary item
   solves a cvxpylayer cone program.
 
+## Full Gurobi CVTSP baseline
+
+`solve_full_cvtsp_gurobi.py` jointly optimizes the target order, take-off and
+landing points, UAV flight times, and carrier travel times. It implements the
+MISOCP from Li, Zhou, and Cote (2025):
+
+- `--formulation basic`: Equations (1)-(13)
+- `--formulation enhanced`: Model+, Equations (1)-(28), default
+
+Example:
+
+```bash
+python3 solve_full_cvtsp_gurobi.py instance/Data/Example_1.txt \
+  --formulation enhanced \
+  --time-limit 3600 \
+  --threads 1 \
+  --mip-gap 1e-6 \
+  --output-json outputs/full_gurobi_baseline/Example_1.json
+```
+
+The JSON result records model build time, Gurobi solve time, total wall time,
+incumbent objective, best bound, MIP gap, node count, and the complete route.
+Use `--verify-fixed-route` to re-solve the returned route with the existing
+fixed-tour CVP model after the baseline timer has stopped.
+
 ## Train
 ```bash
 python -m src.TSPTrainer \
