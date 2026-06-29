@@ -29,6 +29,15 @@ Sinkhorn cvxpylayer auxiliary training:
 - Keep `cvxpylayer_aux_max_instances_per_batch` small because each auxiliary item
   solves a cvxpylayer cone program.
 
+REBAR-style cvxpylayer training:
+- `cvxpylayer_rebar_loss_enable=True` uses hard-route makespan as the main target.
+- `C_hard` comes from the sampled POMO route reward.
+- `C_soft` and `C_cond` are cvxpylayer objectives on relaxed routes.
+- The loss combines a hard-route policy-gradient term and a differentiable
+  cvxpylayer control-variate term, avoiding direct `loss=f(soft_route)` training.
+- `cvxpylayer_rebar_eta`, `cvxpylayer_rebar_temperature`, and
+  `cvxpylayer_rebar_conditional_bias` control the strength and smoothness.
+
 ## Full Gurobi CVTSP baseline
 
 `solve_full_cvtsp_gurobi.py` jointly optimizes the target order, take-off and
