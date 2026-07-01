@@ -20,15 +20,6 @@ Solver backend:
 - `train_n100.py` / `test_n100.py` default to `solver_backend="cvxpylayer"`.
 - Set `solver_backend="gurobi"` in the parameter dict or config to switch back.
 
-Sinkhorn cvxpylayer auxiliary training:
-- `cvxpylayer_aux_enable=True` adds an auxiliary differentiable lower-level loss.
-- The forward route remains the sampled hard POMO route.
-- The backward route uses a Sinkhorn soft permutation so cvxpylayer gradients can
-  reach the decoder probabilities.
-- Start with a small `cvxpylayer_aux_weight` such as `1e-3`.
-- Keep `cvxpylayer_aux_max_instances_per_batch` small because each auxiliary item
-  solves a cvxpylayer cone program.
-
 REBAR-style cvxpylayer training:
 - `cvxpylayer_rebar_loss_enable=True` uses hard-route makespan as the main target.
 - `C_hard` comes from the sampled POMO route reward.

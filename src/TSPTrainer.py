@@ -352,6 +352,16 @@ class OnlineTSPTrainer:
         )
         self.cvxpylayer_aux_enable = bool(self.trainer_params.get("cvxpylayer_aux_enable", False))
         self.cvxpylayer_aux_weight = float(self.trainer_params.get("cvxpylayer_aux_weight", 0.0))
+        if (
+            self.cvxpylayer_objective_loss_enable
+            or self.cvxpylayer_hard_objective_loss_enable
+            or (self.cvxpylayer_aux_enable and self.cvxpylayer_aux_weight > 0)
+        ):
+            raise ValueError(
+                "Sinkhorn/direct cvxpylayer route losses have been removed. "
+                "Use cvxpylayer_rebar_loss_enable=True, or disable cvxpylayer "
+                "route loss for plain POMO policy-gradient training."
+            )
         self.cvxpylayer_route_candidates = max(
             1,
             int(
@@ -385,23 +395,9 @@ class OnlineTSPTrainer:
                 self.trainer_params.get("cvxpylayer_aux_normalize_by_size", False),
             )
         )
-        self.cvxpylayer_soft_route_method = str(
-            self.trainer_params.get("cvxpylayer_soft_route_method", "unmasked_sinkhorn")
-        ).lower()
-        self.cvxpylayer_fixed_start_logit = float(
-            self.trainer_params.get("cvxpylayer_fixed_start_logit", 20.0)
-        )
-        self.cvxpylayer_hard_route_bias = float(
-            self.trainer_params.get("cvxpylayer_hard_route_bias", 5.0)
-        )
-        self.sinkhorn_temperature = float(self.trainer_params.get("sinkhorn_temperature", 0.5))
-        self.sinkhorn_iters = int(self.trainer_params.get("sinkhorn_iters", 20))
         self.cvxpylayer_rebar_eta = float(self.trainer_params.get("cvxpylayer_rebar_eta", 1.0))
         self.cvxpylayer_rebar_temperature = float(
-            self.trainer_params.get(
-                "cvxpylayer_rebar_temperature",
-                self.trainer_params.get("sinkhorn_temperature", 1.0),
-            )
+            self.trainer_params.get("cvxpylayer_rebar_temperature", 1.0)
         )
         self.cvxpylayer_rebar_conditional_bias = float(
             self.trainer_params.get("cvxpylayer_rebar_conditional_bias", 8.0)
@@ -659,13 +655,6 @@ class OnlineTSPTrainer:
             return self._compute_batch_rewards_parallel(instances, rollout_result)
         return self._compute_batch_rewards_serial(instances, rollout_result)
 
-    def _sinkhorn(self, log_scores: torch.Tensor) -> torch.Tensor:
-        out = log_scores
-        for _ in range(max(self.sinkhorn_iters, 1)):
-            out = out - torch.logsumexp(out, dim=-1, keepdim=True)
-            out = out - torch.logsumexp(out, dim=-2, keepdim=True)
-        return out.exp()
-
     @staticmethod
     def _sample_gumbel_like(reference: torch.Tensor) -> torch.Tensor:
         uniform = torch.rand_like(reference).clamp_(1e-9, 1.0 - 1e-9)
@@ -741,27 +730,14 @@ class OnlineTSPTrainer:
         return expanded_batch_indices, expanded_pomo_indices
 
     def _cvxpylayer_route_loss_requested(self) -> bool:
-        return (
-            self.cvxpylayer_rebar_loss_enable
-            or self.cvxpylayer_hard_objective_loss_enable
-            or self.cvxpylayer_objective_loss_enable
-            or (self.cvxpylayer_aux_enable and self.cvxpylayer_aux_weight > 0)
-        )
+        return self.cvxpylayer_rebar_loss_enable
 
     def _cvxpylayer_objective_is_main_loss(self) -> bool:
-        return (
-            self.cvxpylayer_rebar_loss_enable
-            or self.cvxpylayer_hard_objective_loss_enable
-            or self.cvxpylayer_objective_loss_enable
-        )
+        return self.cvxpylayer_rebar_loss_enable
 
     def _loss_mode_name(self) -> str:
         if self.cvxpylayer_rebar_loss_enable:
             return "cvxpylayer_rebar"
-        if self.cvxpylayer_hard_objective_loss_enable:
-            return "cvxpylayer_hard_objective"
-        if self.cvxpylayer_objective_loss_enable:
-            return "cvxpylayer_objective"
         return "pomo_policy"
 
     def _compute_cvxpylayer_route_loss(
@@ -769,7 +745,6 @@ class OnlineTSPTrainer:
         instances,
         sequences: torch.Tensor,
         decoder_prob_steps: list[torch.Tensor],
-        decoder_logit_steps: list[torch.Tensor],
         rewards: torch.Tensor,
         rollout_log_probs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int]:
@@ -779,17 +754,10 @@ class OnlineTSPTrainer:
             or sequences.size(-1) <= 1
         ):
             return zero, 0
-        if self.cvxpylayer_rebar_loss_enable:
-            if not decoder_prob_steps:
-                return zero, 0
-            if rollout_log_probs is None:
-                raise RuntimeError("REBAR loss requires rollout log probabilities")
-        elif not self.cvxpylayer_hard_objective_loss_enable:
-            if self.cvxpylayer_soft_route_method == "unmasked_sinkhorn":
-                if not decoder_logit_steps:
-                    return zero, 0
-            elif not decoder_prob_steps:
-                return zero, 0
+        if not decoder_prob_steps:
+            return zero, 0
+        if rollout_log_probs is None:
+            raise RuntimeError("REBAR loss requires rollout log probabilities")
 
         problem_size = int(sequences.size(-1))
         batch_indices, pomo_indices = self._build_cvxpylayer_route_indices(rewards.detach())
@@ -856,91 +824,56 @@ class OnlineTSPTrainer:
                 route_objectives_inner = route_objectives_inner / max(problem_size, 1)
             return route_objectives_inner
 
-        if self.cvxpylayer_rebar_loss_enable:
-            decoder_probs = torch.stack(decoder_prob_steps, dim=2)
-            selected_decoder_probs = decoder_probs[batch_indices, pomo_indices].to(
-                device=route_device,
-                dtype=route_dtype,
-            )
-            gumbels = (
-                self._sample_gumbel_like(selected_decoder_probs)
-                if self.cvxpylayer_rebar_use_gumbel
-                else None
-            )
-            soft_perm = self._build_stepwise_relaxed_perm(
-                selected_decoder_probs=selected_decoder_probs,
-                hard_perm=hard_perm,
-                temperature=self.cvxpylayer_rebar_temperature,
-                gumbels=gumbels,
-                hard_bias=0.0,
-            )
-            conditional_perm = self._build_stepwise_relaxed_perm(
-                selected_decoder_probs=selected_decoder_probs,
-                hard_perm=hard_perm,
-                temperature=self.cvxpylayer_rebar_temperature,
-                gumbels=gumbels,
-                hard_bias=self.cvxpylayer_rebar_conditional_bias,
-            )
-            soft_objectives = solve_route_perm(soft_perm)
-            conditional_objectives = solve_route_perm(conditional_perm)
+        decoder_probs = torch.stack(decoder_prob_steps, dim=2)
+        selected_decoder_probs = decoder_probs[batch_indices, pomo_indices].to(
+            device=route_device,
+            dtype=route_dtype,
+        )
+        gumbels = (
+            self._sample_gumbel_like(selected_decoder_probs)
+            if self.cvxpylayer_rebar_use_gumbel
+            else None
+        )
+        soft_perm = self._build_stepwise_relaxed_perm(
+            selected_decoder_probs=selected_decoder_probs,
+            hard_perm=hard_perm,
+            temperature=self.cvxpylayer_rebar_temperature,
+            gumbels=gumbels,
+            hard_bias=0.0,
+        )
+        conditional_perm = self._build_stepwise_relaxed_perm(
+            selected_decoder_probs=selected_decoder_probs,
+            hard_perm=hard_perm,
+            temperature=self.cvxpylayer_rebar_temperature,
+            gumbels=gumbels,
+            hard_bias=self.cvxpylayer_rebar_conditional_bias,
+        )
+        soft_objectives = solve_route_perm(soft_perm)
+        conditional_objectives = solve_route_perm(conditional_perm)
 
-            hard_objectives = (-rewards[batch_indices, pomo_indices]).to(
-                device=self.device,
-                dtype=torch.float32,
-            )
-            baseline_objectives = (-rewards[batch_indices]).mean(dim=1).to(
-                device=self.device,
-                dtype=torch.float32,
-            )
-            selected_log_probs = rollout_log_probs[batch_indices, pomo_indices].to(
-                device=self.device,
-                dtype=torch.float32,
-            )
-            eta = float(self.cvxpylayer_rebar_eta)
-            soft_objectives = soft_objectives.to(device=self.device, dtype=torch.float32)
-            conditional_objectives = conditional_objectives.to(device=self.device, dtype=torch.float32)
-            policy_control = (
-                hard_objectives.detach()
-                - eta * conditional_objectives.detach()
-                - baseline_objectives.detach()
-            )
-            policy_term = (policy_control * selected_log_probs).mean()
-            pathwise_term = eta * (soft_objectives - conditional_objectives).mean()
-            return policy_term + pathwise_term, route_count
-
-        if self.cvxpylayer_hard_objective_loss_enable:
-            route_perm = hard_perm
-        elif self.cvxpylayer_soft_route_method == "unmasked_sinkhorn":
-            decoder_logits = torch.stack(decoder_logit_steps, dim=2)
-            selected_decoder_logits = decoder_logits[batch_indices, pomo_indices].to(
-                device=route_device,
-                dtype=route_dtype,
-            )
-            start_scores = torch.full_like(
-                hard_perm[:, :1, :],
-                -self.cvxpylayer_fixed_start_logit,
-            )
-            start_scores = start_scores.scatter(
-                2,
-                selected_sequences[:, :1, None],
-                self.cvxpylayer_fixed_start_logit,
-            )
-            sinkhorn_scores = torch.cat([start_scores, selected_decoder_logits], dim=1)
-            sinkhorn_scores = sinkhorn_scores + self.cvxpylayer_hard_route_bias * hard_perm.detach()
-            sinkhorn_scores = sinkhorn_scores / max(self.sinkhorn_temperature, 1e-6)
-            soft_perm = self._sinkhorn(sinkhorn_scores)
-            route_perm = hard_perm.detach() - soft_perm.detach() + soft_perm
-        else:
-            decoder_probs = torch.stack(decoder_prob_steps, dim=2)
-            selected_decoder_probs = decoder_probs[batch_indices, pomo_indices].to(device=route_device, dtype=route_dtype)
-            start_row = hard_perm[:, :1, :]
-            soft_base = torch.cat([start_row, selected_decoder_probs], dim=1)
-            sinkhorn_scores = torch.log(soft_base.clamp_min(1e-12)) / max(self.sinkhorn_temperature, 1e-6)
-            soft_perm = self._sinkhorn(sinkhorn_scores)
-            route_perm = hard_perm.detach() - soft_perm.detach() + soft_perm
-
-        route_objectives = solve_route_perm(route_perm)
-        return route_objectives.mean().to(self.device, dtype=torch.float32), route_count
+        hard_objectives = (-rewards[batch_indices, pomo_indices]).to(
+            device=self.device,
+            dtype=torch.float32,
+        )
+        baseline_objectives = (-rewards[batch_indices]).mean(dim=1).to(
+            device=self.device,
+            dtype=torch.float32,
+        )
+        selected_log_probs = rollout_log_probs[batch_indices, pomo_indices].to(
+            device=self.device,
+            dtype=torch.float32,
+        )
+        eta = float(self.cvxpylayer_rebar_eta)
+        soft_objectives = soft_objectives.to(device=self.device, dtype=torch.float32)
+        conditional_objectives = conditional_objectives.to(device=self.device, dtype=torch.float32)
+        policy_control = (
+            hard_objectives.detach()
+            - eta * conditional_objectives.detach()
+            - baseline_objectives.detach()
+        )
+        policy_term = (policy_control * selected_log_probs).mean()
+        pathwise_term = eta * (soft_objectives - conditional_objectives).mean()
+        return policy_term + pathwise_term, route_count
 
     def _train_one_batch(self, batch_size: int) -> tuple[float, float, float, float, int, float, int]:
         self.model.train()
@@ -955,20 +888,17 @@ class OnlineTSPTrainer:
         pomo_size = self.env.pomo_size
         log_prob_sum = torch.zeros((batch_size_eff, pomo_size), device=self.device)
         decoder_prob_steps: list[torch.Tensor] = []
-        decoder_logit_steps: list[torch.Tensor] = []
 
         while not done:
             selected_count_before = state.selected_count
-            selected, prob, all_probs, all_logits = self.model(
+            selected, prob, all_probs = self.model(
                 state,
                 decode_type="sample",
                 use_pomo_start=True,
                 return_all_probs=True,
-                return_all_logits=True,
             )
             if selected_count_before >= 2:
                 decoder_prob_steps.append(all_probs[:, :, 1:])
-                decoder_logit_steps.append(all_logits[:, :, 1:])
             state, _, done = self.env.step(selected)
             log_prob_sum = log_prob_sum + prob.clamp_min(1e-12).log()
 
@@ -987,18 +917,13 @@ class OnlineTSPTrainer:
             instances=instances,
             sequences=sequences,
             decoder_prob_steps=decoder_prob_steps,
-            decoder_logit_steps=decoder_logit_steps,
             rewards=rewards,
             rollout_log_probs=rollout_result.log_probs,
         )
-        if (
-            self.cvxpylayer_rebar_loss_enable
-            or self.cvxpylayer_hard_objective_loss_enable
-            or self.cvxpylayer_objective_loss_enable
-        ):
+        if self.cvxpylayer_rebar_loss_enable:
             if cvxpylayer_route_count == 0:
                 raise RuntimeError(
-                    "cvxpylayer objective loss was enabled but no cvxpylayer loss was computed"
+                    "REBAR cvxpylayer loss was enabled but no cvxpylayer loss was computed"
                 )
             loss = cvxpylayer_route_loss
         else:
