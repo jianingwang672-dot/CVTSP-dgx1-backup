@@ -4,11 +4,12 @@
 DEBUG_MODE = False
 USE_CUDA = not DEBUG_MODE
 CUDA_DEVICE_NUM = 0
-REWARD_PARALLEL = True
-REWARD_BACKEND = "persistent_pool"
-REWARD_PARALLEL_WORKERS = 64
+REWARD_PARALLEL = False
+REWARD_BACKEND = "cvxpylayer_batch"
+REWARD_PARALLEL_WORKERS = 0
 PARALLEL_SOLVER_THREADS = 1
 SOLVER_BACKEND = "cvxpylayer"
+CVXPYLAYER_REWARD_BATCH_SIZE = 128
 
 
 ##########################################################################################
@@ -82,7 +83,7 @@ trainer_params = {
     "penalty_reward": -1e6,
     "grad_clip": 1.0,
     "seed": 1234,
-    "result_folder": os.path.join("outputs", "train__cvxpylayer_rebar_1epoch"),
+    "result_folder": os.path.join("outputs", "train__cvxpylayer_rebar_batch_1epoch"),
     "log_level": "INFO",
     "progress_log_percent": 1.0,
     "progress_bar_width": 24,
@@ -90,6 +91,7 @@ trainer_params = {
     "reward_parallel_workers": REWARD_PARALLEL_WORKERS if REWARD_PARALLEL else 0,
     "parallel_solver_threads": PARALLEL_SOLVER_THREADS,
     "reward_parallel_chunksize": 1,
+    "cvxpylayer_reward_batch_size": CVXPYLAYER_REWARD_BATCH_SIZE,
     "checkpoint_path": "/home/Mingfan/wjn/CVTSP/outputs/train__fresh/best.pt",
 }
 

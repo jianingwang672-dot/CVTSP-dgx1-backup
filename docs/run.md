@@ -29,6 +29,15 @@ REBAR-style cvxpylayer training:
 - `cvxpylayer_rebar_eta`, `cvxpylayer_rebar_temperature`, and
   `cvxpylayer_rebar_conditional_bias` control the strength and smoothness.
 
+Batched cvxpylayer rewards:
+- `reward_backend="cvxpylayer_batch"` computes hard-route rewards by grouping
+  routes with the same problem size and solving chunks with one batched
+  cvxpylayer call.
+- `cvxpylayer_reward_batch_size` controls the number of hard routes per
+  cvxpylayer call. Start with 64 or 128, then increase if memory is stable.
+- This backend is for `solver_backend="cvxpylayer"` and replaces route-level
+  worker pools for hard reward computation.
+
 ## Full Gurobi CVTSP baseline
 
 `solve_full_cvtsp_gurobi.py` jointly optimizes the target order, take-off and

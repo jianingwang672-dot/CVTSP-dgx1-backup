@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import multiprocessing as mp
+import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
@@ -454,12 +455,21 @@ class OnlineTSPTrainer:
         self.reward_parallel_workers = int(self.trainer_params.get("reward_parallel_workers", 0))
         self.parallel_solver_threads = int(self.trainer_params.get("parallel_solver_threads", 1))
         self.reward_parallel_chunksize = int(self.trainer_params.get("reward_parallel_chunksize", 1))
+        self.cvxpylayer_reward_batch_size = int(
+            self.trainer_params.get("cvxpylayer_reward_batch_size", 128)
+        )
         self.reward_backend = str(
             self.trainer_params.get(
                 "reward_backend",
                 "executor" if self.reward_parallel_workers > 0 else "serial",
             )
         ).lower()
+        if self.reward_backend == "cvxpylayer_batch" and str(self.solver_config.solver_backend).lower() not in {
+            "cvxpylayer",
+            "cvxpy_layer",
+            "cvxpy",
+        }:
+            raise ValueError("reward_backend='cvxpylayer_batch' requires solver_backend='cvxpylayer'")
         self.reward_pool_queue_size = int(
             self.trainer_params.get("reward_pool_queue_size", max(self.reward_parallel_workers * 4, 1))
         )
@@ -648,7 +658,128 @@ class OnlineTSPTrainer:
         feasible_ratio = feasible_count / max(batch_size * max(pomo_size, 1), 1)
         return rewards, feasible_ratio, solver_calls
 
+    def _compute_batch_rewards_cvxpylayer_batch(self, instances, rollout_result):
+        rewards, feasible_count, pending, batch_size, pomo_size = self._prepare_pending_rewards(instances, rollout_result)
+        solver_calls = len(pending)
+        if not pending:
+            feasible_ratio = feasible_count / max(batch_size * max(pomo_size, 1), 1)
+            return rewards, feasible_ratio, solver_calls
+
+        route_dtype = torch.float64 if self.solver_config.cvxpylayer_dtype == "float64" else torch.float32
+        route_device = torch.device("cpu")
+        chunk_size = self.cvxpylayer_reward_batch_size
+        if chunk_size <= 0:
+            chunk_size = len(pending)
+
+        grouped_entries: dict[int, list[dict[str, Any]]] = {}
+        for entry in pending.values():
+            grouped_entries.setdefault(int(entry["instance"].J), []).append(entry)
+
+        fallback_solver_config = SolverConfig(
+            solver_backend=self.solver_config.solver_backend,
+            gurobi_time_limit=self.solver_config.gurobi_time_limit,
+            gurobi_threads=self.parallel_solver_threads,
+            output_flag=self.solver_config.output_flag,
+            cvxpylayer_solver_args=dict(self.solver_config.cvxpylayer_solver_args),
+            cvxpylayer_dtype=self.solver_config.cvxpylayer_dtype,
+        )
+
+        def write_solution(entry: dict[str, Any], solution: SPSolution) -> None:
+            nonlocal feasible_count
+            instance = entry["instance"]
+            sequence = entry["sequence"]
+            self.cache.put(instance, sequence, solution)
+            for batch_index, pomo_index in entry["positions"]:
+                if solution.success:
+                    rewards[batch_index, pomo_index] = -float(solution.objective)
+                    feasible_count += 1
+                else:
+                    rewards[batch_index, pomo_index] = self.penalty_reward
+
+        for problem_size, entries in grouped_entries.items():
+            for start in range(0, len(entries), chunk_size):
+                chunk = entries[start : start + chunk_size]
+                chunk_start = time.perf_counter()
+                try:
+                    ordered_targets = torch.stack(
+                        [
+                            torch.as_tensor(
+                                entry["instance"].targets[entry["sequence"]],
+                                dtype=route_dtype,
+                                device=route_device,
+                            )
+                            for entry in chunk
+                        ],
+                        dim=0,
+                    )
+                    depots = torch.stack(
+                        [
+                            torch.as_tensor(entry["instance"].depot, dtype=route_dtype, device=route_device)
+                            for entry in chunk
+                        ],
+                        dim=0,
+                    )
+                    carrier_speeds = torch.as_tensor(
+                        [float(entry["instance"].carrier_speed) for entry in chunk],
+                        dtype=route_dtype,
+                        device=route_device,
+                    )
+                    uav_speeds = torch.as_tensor(
+                        [float(entry["instance"].uav_speed) for entry in chunk],
+                        dtype=route_dtype,
+                        device=route_device,
+                    )
+                    endurances = torch.as_tensor(
+                        [float(entry["instance"].endurance) for entry in chunk],
+                        dtype=route_dtype,
+                        device=route_device,
+                    )
+                    result = solve_ordered_targets_torch(
+                        depot=depots,
+                        ordered_targets=ordered_targets,
+                        carrier_speed=carrier_speeds,
+                        uav_speed=uav_speeds,
+                        endurance=endurances,
+                        solver_args=self.solver_config.cvxpylayer_solver_args,
+                        dtype=route_dtype,
+                    )
+                    objectives = result["objective"].detach().cpu()
+                    if not torch.isfinite(objectives).all():
+                        raise RuntimeError("batched cvxpylayer objective contains non-finite values")
+                    solve_time = time.perf_counter() - chunk_start
+                    per_route_time = solve_time / max(len(chunk), 1)
+                    for entry, objective in zip(chunk, objectives.tolist()):
+                        solution = SPSolution(
+                            objective=float(objective),
+                            makespan=float(objective),
+                            success=True,
+                            status="CVXPYLAYER_BATCH",
+                            solve_time=per_route_time,
+                            sequence=list(entry["sequence"]),
+                            raw_debug={
+                                "problem_size": problem_size,
+                                "batch_size": len(chunk),
+                                "solver_args": dict(self.solver_config.cvxpylayer_solver_args),
+                            },
+                        )
+                        write_solution(entry, solution)
+                except Exception as exc:
+                    logger.warning(
+                        "Batched cvxpylayer reward failed for J={} chunk={} ({}); falling back to single solves",
+                        problem_size,
+                        len(chunk),
+                        type(exc).__name__,
+                    )
+                    for entry in chunk:
+                        solution = solve(entry["instance"], entry["sequence"], fallback_solver_config)
+                        write_solution(entry, solution)
+
+        feasible_ratio = feasible_count / max(batch_size * max(pomo_size, 1), 1)
+        return rewards, feasible_ratio, solver_calls
+
     def _compute_batch_rewards(self, instances, rollout_result):
+        if self.reward_backend == "cvxpylayer_batch":
+            return self._compute_batch_rewards_cvxpylayer_batch(instances, rollout_result)
         if self.reward_backend == "persistent_pool" and self.reward_parallel_workers > 0:
             return self._compute_batch_rewards_persistent_pool(instances, rollout_result)
         if self.reward_backend == "executor" and self.reward_parallel_workers > 0:
