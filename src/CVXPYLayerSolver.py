@@ -23,6 +23,7 @@ class CVPLayerBundle:
 
 
 _LAYER_CACHE: dict[int, CVPLayerBundle] = {}
+_OBJECTIVE_LAYER_CACHE: dict[int, CVPLayerBundle] = {}
 _DLL_DIRECTORY_HANDLES: list[Any] = []
 _DLL_DIRECTORY_PATHS: set[str] = set()
 
@@ -62,13 +63,10 @@ def _import_cvxpy_layer():
     return cp, CvxpyLayer
 
 
-def get_cvp_layer(problem_size: int) -> CVPLayerBundle:
+def _build_cvp_layer(problem_size: int, *, objective_only: bool) -> CVPLayerBundle:
     problem_size = int(problem_size)
     if problem_size <= 0:
         raise ValueError("problem_size must be positive")
-    cached = _LAYER_CACHE.get(problem_size)
-    if cached is not None:
-        return cached
 
     cp, CvxpyLayer = _import_cvxpy_layer()
 
@@ -107,15 +105,35 @@ def get_cvp_layer(problem_size: int) -> CVPLayerBundle:
     if not problem.is_dpp():
         raise RuntimeError("fixed-tour CVP cvxpylayer formulation is not DPP")
 
+    output_variables = [tau, tseg] if objective_only else [takeoff, landing, t1, t2, tau, tseg]
     bundle = CVPLayerBundle(
         problem_size=problem_size,
         layer=CvxpyLayer(
             problem,
             parameters=[depot, targets, carrier_speed, uav_speed, endurance],
-            variables=[takeoff, landing, t1, t2, tau, tseg],
+            variables=output_variables,
         ),
     )
+    return bundle
+
+
+def get_cvp_layer(problem_size: int) -> CVPLayerBundle:
+    problem_size = int(problem_size)
+    cached = _LAYER_CACHE.get(problem_size)
+    if cached is not None:
+        return cached
+    bundle = _build_cvp_layer(problem_size, objective_only=False)
     _LAYER_CACHE[problem_size] = bundle
+    return bundle
+
+
+def get_cvp_objective_layer(problem_size: int) -> CVPLayerBundle:
+    problem_size = int(problem_size)
+    cached = _OBJECTIVE_LAYER_CACHE.get(problem_size)
+    if cached is not None:
+        return cached
+    bundle = _build_cvp_layer(problem_size, objective_only=True)
+    _OBJECTIVE_LAYER_CACHE[problem_size] = bundle
     return bundle
 
 
@@ -136,23 +154,14 @@ def _as_tensor(value: Any, *, device: torch.device, dtype: torch.dtype) -> torch
     return torch.as_tensor(value, device=device, dtype=dtype)
 
 
-def solve_ordered_targets_torch(
+def _prepare_cvp_tensors(
     depot: torch.Tensor | np.ndarray,
     ordered_targets: torch.Tensor | np.ndarray,
     carrier_speed: torch.Tensor | float,
     uav_speed: torch.Tensor | float,
     endurance: torch.Tensor | float,
-    solver_args: dict[str, Any] | None = None,
     dtype: str | torch.dtype = "float64",
-) -> dict[str, torch.Tensor]:
-    """Differentiable fixed-tour CVP layer.
-
-    `ordered_targets` is the already ordered target coordinate tensor with shape (J, 2)
-    or a batched tensor with shape (B, J, 2).
-    Gradients can flow to tensor parameters that require gradients. A hard permutation
-    index is still non-differentiable; use a soft ordered-target tensor if the upper
-    policy needs direct pathwise gradients.
-    """
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     if torch.is_tensor(ordered_targets):
         device = ordered_targets.device
     elif torch.is_tensor(depot):
@@ -193,6 +202,34 @@ def solve_ordered_targets_torch(
             endurance_t = endurance_t.reshape(1).expand(batch_size)
         else:
             endurance_t = endurance_t.reshape(batch_size)
+    return depot_t, targets_t, carrier_speed_t, uav_speed_t, endurance_t, problem_size
+
+
+def solve_ordered_targets_torch(
+    depot: torch.Tensor | np.ndarray,
+    ordered_targets: torch.Tensor | np.ndarray,
+    carrier_speed: torch.Tensor | float,
+    uav_speed: torch.Tensor | float,
+    endurance: torch.Tensor | float,
+    solver_args: dict[str, Any] | None = None,
+    dtype: str | torch.dtype = "float64",
+) -> dict[str, torch.Tensor]:
+    """Differentiable fixed-tour CVP layer.
+
+    `ordered_targets` is the already ordered target coordinate tensor with shape (J, 2)
+    or a batched tensor with shape (B, J, 2).
+    Gradients can flow to tensor parameters that require gradients. A hard permutation
+    index is still non-differentiable; use a soft ordered-target tensor if the upper
+    policy needs direct pathwise gradients.
+    """
+    depot_t, targets_t, carrier_speed_t, uav_speed_t, endurance_t, problem_size = _prepare_cvp_tensors(
+        depot=depot,
+        ordered_targets=ordered_targets,
+        carrier_speed=carrier_speed,
+        uav_speed=uav_speed,
+        endurance=endurance,
+        dtype=dtype,
+    )
 
     layer = get_cvp_layer(problem_size).layer
     merged_solver_args = dict(DEFAULT_SOLVER_ARGS)
@@ -221,6 +258,42 @@ def solve_ordered_targets_torch(
         "tau": tau,
         "Tseg": tseg,
     }
+
+
+def solve_ordered_targets_objective_torch(
+    depot: torch.Tensor | np.ndarray,
+    ordered_targets: torch.Tensor | np.ndarray,
+    carrier_speed: torch.Tensor | float,
+    uav_speed: torch.Tensor | float,
+    endurance: torch.Tensor | float,
+    solver_args: dict[str, Any] | None = None,
+    dtype: str | torch.dtype = "float64",
+) -> torch.Tensor:
+    """Fixed-tour CVP objective-only layer for high-throughput hard rewards."""
+    depot_t, targets_t, carrier_speed_t, uav_speed_t, endurance_t, problem_size = _prepare_cvp_tensors(
+        depot=depot,
+        ordered_targets=ordered_targets,
+        carrier_speed=carrier_speed,
+        uav_speed=uav_speed,
+        endurance=endurance,
+        dtype=dtype,
+    )
+    layer = get_cvp_objective_layer(problem_size).layer
+    merged_solver_args = dict(DEFAULT_SOLVER_ARGS)
+    if solver_args:
+        merged_solver_args.update(solver_args)
+
+    tau, tseg = layer(
+        depot_t,
+        targets_t,
+        carrier_speed_t,
+        uav_speed_t,
+        endurance_t,
+        solver_args=merged_solver_args,
+    )
+    if targets_t.ndim == 2:
+        return tau.sum() + tseg.sum()
+    return tau.sum(dim=-1) + tseg.sum(dim=-1)
 
 
 class CVPObjectiveLayer(nn.Module):
@@ -285,5 +358,33 @@ def solve_fixed_sequence_numpy(
         "t2": result_t["t2"].detach().cpu().numpy(),
         "tau": result_t["tau"].detach().cpu().numpy(),
         "Tseg": result_t["Tseg"].detach().cpu().numpy(),
+        "solver_args": dict(DEFAULT_SOLVER_ARGS, **(solver_args or {})),
+    }
+
+
+def solve_fixed_sequence_objective_numpy(
+    depot: np.ndarray,
+    targets: np.ndarray,
+    sequence: list[int],
+    carrier_speed: float,
+    uav_speed: float,
+    endurance: float,
+    solver_args: dict[str, Any] | None = None,
+    dtype: str | torch.dtype = "float64",
+) -> dict[str, Any]:
+    ordered_targets = np.asarray(targets, dtype=float)[list(sequence)]
+    with torch.no_grad():
+        objective = solve_ordered_targets_objective_torch(
+            depot=np.asarray(depot, dtype=float),
+            ordered_targets=ordered_targets,
+            carrier_speed=float(carrier_speed),
+            uav_speed=float(uav_speed),
+            endurance=float(endurance),
+            solver_args=solver_args,
+            dtype=dtype,
+        )
+    return {
+        "obj": float(objective.detach().cpu().item()),
+        "status": "CVXPYLAYER_OBJECTIVE",
         "solver_args": dict(DEFAULT_SOLVER_ARGS, **(solver_args or {})),
     }

@@ -4,12 +4,12 @@
 DEBUG_MODE = False
 USE_CUDA = not DEBUG_MODE
 CUDA_DEVICE_NUM = 0
-REWARD_PARALLEL = False
-REWARD_BACKEND = "cvxpylayer_batch"
-REWARD_PARALLEL_WORKERS = 0
+REWARD_PARALLEL = True
+REWARD_BACKEND = "cvxpylayer_chunk_pool"
+REWARD_PARALLEL_WORKERS = 32
 PARALLEL_SOLVER_THREADS = 1
 SOLVER_BACKEND = "cvxpylayer"
-CVXPYLAYER_REWARD_BATCH_SIZE = 128
+CVXPYLAYER_REWARD_BATCH_SIZE = 8
 
 
 ##########################################################################################
@@ -83,7 +83,7 @@ trainer_params = {
     "penalty_reward": -1e6,
     "grad_clip": 1.0,
     "seed": 1234,
-    "result_folder": os.path.join("outputs", "train__cvxpylayer_rebar_batch_1epoch"),
+    "result_folder": os.path.join("outputs", "train__cvxpylayer_rebar_chunkpool_1epoch"),
     "log_level": "INFO",
     "progress_log_percent": 1.0,
     "progress_bar_width": 24,

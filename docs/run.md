@@ -30,11 +30,14 @@ REBAR-style cvxpylayer training:
   `cvxpylayer_rebar_conditional_bias` control the strength and smoothness.
 
 Batched cvxpylayer rewards:
-- `reward_backend="cvxpylayer_batch"` computes hard-route rewards by grouping
-  routes with the same problem size and solving chunks with one batched
-  cvxpylayer call.
+- `reward_backend="cvxpylayer_chunk_pool"` computes hard-route rewards with
+  multiple worker processes. Each worker solves a small chunk of routes with one
+  batched objective-only cvxpylayer call.
+- `reward_backend="cvxpylayer_batch"` keeps the same chunked solve in the main
+  process and is mainly useful for debugging.
 - `cvxpylayer_reward_batch_size` controls the number of hard routes per
-  cvxpylayer call. Start with 64 or 128, then increase if memory is stable.
+  worker-side cvxpylayer call. Start with 8 or 16, then tune with the worker
+  count.
 - This backend is for `solver_backend="cvxpylayer"` and replaces route-level
   worker pools for hard reward computation.
 
